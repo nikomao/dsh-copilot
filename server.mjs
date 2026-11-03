@@ -116,6 +116,135 @@ const COPILOT_HEADERS = {
 };
 let directAuth = null;            // { token, base, expires }
 let modelsCache = { at: 0, data: null };
+const USAGE_DIR = path.join(SCRIPT_DIR, '.usage');
+const USAGE_FILE = path.join(USAGE_DIR, 'usage.jsonl');
+const QUOTA_TTL_MS = 5 * 60 * 1000;
+fs.mkdirSync(USAGE_DIR, { recursive: true });
+let quotaCache = { at: 0, data: null };
+
+function creditsFromUsage(cu) {
+  if (cu && typeof cu.total_nano_aiu === 'number') return { credits: cu.total_nano_aiu / 1e9, raw: cu.total_nano_aiu };
+  if (!cu || !Array.isArray(cu.token_details)) return { credits: null, raw: 0 };
+  let raw = 0;
+  for (const d of cu.token_details) {
+    const tc = Number(d.token_count) || 0;
+    const bs = Number(d.batch_size) || 1;
+    const cpb = Number(d.cost_per_batch) || 0;
+    raw += (tc / bs) * cpb;
+  }
+  return { credits: raw / 1e9, raw };
+}
+
+function recordUsage(rec) {
+  try {
+    fs.appendFileSync(USAGE_FILE, JSON.stringify(rec) + '\n');
+  } catch (e) {
+    log('warn', 'usage record failed: ' + e.message);
+  }
+}
+
+function readUsage() {
+  try {
+    return fs.readFileSync(USAGE_FILE, 'utf8')
+      .split('\n').filter(Boolean)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
+function parseRange(q) {
+  if (!q || q === 'all') return 0;
+  if (q === 'today') { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); }
+  const m = /^(\d+)([dhm])$/.exec(q);
+  if (!m) return 0;
+  const n = Number(m[1]);
+  const unit = m[2] === 'd' ? 86400000 : m[2] === 'h' ? 3600000 : 60000;
+  return Date.now() - n * unit;
+}
+
+function p95(nums) {
+  if (!nums.length) return null;
+  const s = [...nums].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))];
+}
+
+function usageSummary(range) {
+  const since = parseRange(range);
+  const rows = readUsage().filter(r => (r.ts || 0) >= since);
+  const byDay = new Map(), byModel = new Map();
+  let credits = 0, creditsKnown = 0, input = 0, output = 0, errors = 0;
+  const ttfts = [];
+  for (const r of rows) {
+    const day = new Date(r.ts).toISOString().slice(0, 10);
+    const d = byDay.get(day) || { date: day, requests: 0, credits: 0, input: 0, output: 0 };
+    d.requests++; d.input += r.input_tokens || 0; d.output += r.output_tokens || 0;
+    if (typeof r.credits === 'number') d.credits += r.credits;
+    byDay.set(day, d);
+    const mk = r.model || 'unknown';
+    const mo = byModel.get(mk) || { model: mk, requests: 0, credits: 0, input: 0, output: 0 };
+    mo.requests++; mo.input += r.input_tokens || 0; mo.output += r.output_tokens || 0;
+    if (typeof r.credits === 'number') mo.credits += r.credits;
+    byModel.set(mk, mo);
+    if (typeof r.credits === 'number') { credits += r.credits; creditsKnown++; }
+    input += r.input_tokens || 0; output += r.output_tokens || 0;
+    if (r.ttft_ms != null) ttfts.push(r.ttft_ms);
+    if (r.ok === false || (r.status && r.status >= 400)) errors++;
+  }
+  const round = v => Math.round(v * 1e6) / 1e6;
+  return {
+    range: range || 'all',
+    since,
+    summary: {
+      requests: rows.length,
+      errors,
+      input_tokens: input,
+      output_tokens: output,
+      credits: round(credits),
+      credits_requests: creditsKnown,
+      avg_ttft_ms: ttfts.length ? Math.round(ttfts.reduce((a, b) => a + b, 0) / ttfts.length) : null,
+      p95_ttft_ms: p95(ttfts),
+    },
+    by_day: [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date)).map(d => ({ ...d, credits: round(d.credits) })),
+    by_model: [...byModel.values()].sort((a, b) => b.credits - a.credits || b.requests - a.requests).map(m => ({ ...m, credits: round(m.credits) })),
+    recent: rows.slice(-50).reverse(),
+  };
+}
+
+async function getQuota() {
+  if (quotaCache.data && Date.now() - quotaCache.at < QUOTA_TTL_MS) return quotaCache.data;
+  const gh = readGhToken();
+  if (!gh) return null;
+  try {
+    const r = await fetch('https://api.github.com/copilot_internal/user', {
+      headers: { Authorization: 'Bearer ' + gh, Accept: 'application/json', 'User-Agent': 'copilot-bridge' },
+    });
+    if (!r.ok) { log('warn', 'quota fetch failed: HTTP ' + r.status); return null; }
+    const j = await r.json();
+    const quotas = j.quota_snapshots || {};
+    const data = {
+      login: j.login,
+      plan: j.copilot_plan,
+      sku: j.access_type_sku,
+      reset_date: j.quota_reset_date,
+      quotas: Object.fromEntries(Object.entries(quotas).map(([k, v]) => [k, {
+        unlimited: v.unlimited,
+        percent_remaining: v.percent_remaining,
+        remaining: v.quota_remaining,
+        used: v.credits_used,
+        overage_permitted: v.overage_permitted,
+      }])),
+      fetched_at: Date.now(),
+    };
+    quotaCache = { at: Date.now(), data };
+    return data;
+  } catch (e) {
+    log('warn', 'quota fetch error: ' + e.message);
+    return null;
+  }
+}
+
 
 function readGhToken() {
   try {
@@ -165,33 +294,92 @@ async function directModels() {
 }
 
 async function handleResponses(req, res, rawBody) {
+  const t0 = Date.now();
+  let parsedReq = null;
+  try { parsedReq = JSON.parse(rawBody); } catch (_) { /* keep null */ }
+  const reqModel = parsedReq && parsedReq.model ? String(parsedReq.model) : null;
+  const reqStream = !!(parsedReq && parsedReq.stream);
+  const reqId = 'req-' + Math.random().toString(36).slice(2, 12);
+  const base = {
+    ts: Date.now(), id: reqId, mode: 'direct', model: reqModel, stream: reqStream,
+    tools: parsedReq && Array.isArray(parsedReq.tools) ? parsedReq.tools.length : 0,
+    body_bytes: Buffer.byteLength(rawBody),
+  };
   const a = await getAuth();
-  if (!a) return sendJson(res, 503, errorPayload('copilot direct auth unavailable (no valid GitHub token); falling back not possible on this endpoint', 'auth_error'));
+  if (!a) {
+    recordUsage(Object.assign({}, base, { ok: false, status: 0, error: 'no_auth', duration_ms: Date.now() - t0 }));
+    return sendJson(res, 503, errorPayload('copilot direct auth unavailable (no valid GitHub token)', 'auth_error'));
+  }
   let initiator = 'user';
+  const input = parsedReq && Array.isArray(parsedReq.input) ? parsedReq.input : [];
+  const last = input[input.length - 1];
+  if (last && last.role && last.role !== 'user') initiator = 'agent';
+  let r;
   try {
-    const parsed = JSON.parse(rawBody);
-    const input = Array.isArray(parsed.input) ? parsed.input : [];
-    const last = input[input.length - 1];
-    if (last && last.role && last.role !== 'user') initiator = 'agent';
-  } catch (_) { /* keep default */ }
-  const r = await fetch(a.base + '/responses', {
-    method: 'POST',
-    headers: Object.assign({}, COPILOT_HEADERS, {
-      Authorization: 'Bearer ' + a.token,
-      'Content-Type': 'application/json',
-      Accept: req.headers.accept || 'text/event-stream',
-      'X-Initiator': initiator,
-      'Openai-Intent': 'conversation-edits',
-    }),
-    body: rawBody,
-  });
+    r = await fetch(a.base + '/responses', {
+      method: 'POST',
+      headers: Object.assign({}, COPILOT_HEADERS, {
+        Authorization: 'Bearer ' + a.token,
+        'Content-Type': 'application/json',
+        Accept: req.headers.accept || 'text/event-stream',
+        'X-Initiator': initiator,
+        'Openai-Intent': 'conversation-edits',
+      }),
+      body: rawBody,
+    });
+  } catch (e) {
+    recordUsage(Object.assign({}, base, { ok: false, status: 0, error: e.message, duration_ms: Date.now() - t0 }));
+    return sendJson(res, 502, errorPayload('upstream fetch failed: ' + e.message, 'bridge_upstream_error'));
+  }
+  const ctype = r.headers.get('content-type') || '';
+  const sse = ctype.includes('text/event-stream');
   res.writeHead(r.status, {
-    'Content-Type': r.headers.get('content-type') || 'application/json; charset=utf-8',
+    'Content-Type': ctype || 'application/json; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     'X-Accel-Buffering': 'no',
   });
-  if (r.body) for await (const chunk of r.body) res.write(chunk);
+  let ttft = null, sseBuf = '', nonStream = '', captured = null;
+  if (r.body) {
+    for await (const chunk of r.body) {
+      if (ttft === null) ttft = Date.now() - t0;
+      res.write(chunk);
+      const s = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+      if (!sse) { nonStream += s; continue; }
+      sseBuf += s;
+      let idx;
+      while ((idx = sseBuf.indexOf('\n\n')) !== -1) {
+        const frame = sseBuf.slice(0, idx);
+        sseBuf = sseBuf.slice(idx + 2);
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (!data || data === '[DONE]') continue;
+          try {
+            const j = JSON.parse(data);
+            const u = (j && j.response && j.response.usage) || (j && j.usage) || null;
+            const c = (j && j.copilot_usage) || (j && j.response && j.response.copilot_usage) || null;
+            if (u || c) captured = { usage: u, copilot_usage: c };
+          } catch (_) { /* partial frame */ }
+        }
+      }
+    }
+  }
   res.end();
+  let usage = null, cu = null;
+  if (sse) {
+    if (captured) { usage = captured.usage || null; cu = captured.copilot_usage || null; }
+  } else {
+    try { const j = JSON.parse(nonStream); usage = j.usage || null; cu = j.copilot_usage || null; } catch (_) { /* ignore */ }
+  }
+  const cred = creditsFromUsage(cu);
+  recordUsage(Object.assign({}, base, {
+    ok: r.ok, status: r.status,
+    input_tokens: usage ? usage.input_tokens : null,
+    output_tokens: usage ? usage.output_tokens : null,
+    cached_tokens: usage && usage.input_tokens_details ? usage.input_tokens_details.cached_tokens : null,
+    credits: cred.credits, credits_raw: cred.raw,
+    ttft_ms: ttft, duration_ms: Date.now() - t0,
+  }));
 }
 
 function runCopilot(prompt, model, onChunk) {
@@ -266,6 +454,7 @@ function listModels() {
 
 async function handleChat(req, res, body) {
   const release = await acquire();
+  const t0 = Date.now();
   try {
     const messages = Array.isArray(body.messages) ? body.messages : [];
     if (!messages.length) return sendJson(res, 400, errorPayload('messages is required', 'invalid_request_error'));
@@ -281,9 +470,14 @@ async function handleChat(req, res, body) {
       if (!content.trim()) {
         const msg = (err || '').trim().split('\n').slice(-3).join('\n') || 'copilot returned empty output (exit ' + code + ')';
         const status = /is not available/i.test(msg) ? 400 : 502;
+        recordUsage({ ts: Date.now(), id, mode: 'cli', model, stream: false, ok: false, status,
+          input_tokens: estimateTokens(prompt), output_tokens: null, credits: null, ttft_ms: null, duration_ms: Date.now() - t0 });
         return sendJson(res, status, errorPayload(msg, status === 400 ? 'model_not_found' : 'bridge_upstream_error'));
       }
       const usage = { prompt_tokens: estimateTokens(prompt), completion_tokens: estimateTokens(content), total_tokens: estimateTokens(prompt) + estimateTokens(content) };
+      recordUsage({ ts: Date.now(), id, mode: 'cli', model, stream: false, ok: true, status: 200,
+        input_tokens: usage.prompt_tokens, output_tokens: usage.completion_tokens,
+        credits: null, ttft_ms: null, duration_ms: Date.now() - t0 });
       return sendJson(res, 200, {
         id, object: 'chat.completion', created, model,
         choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
@@ -324,6 +518,8 @@ async function handleChat(req, res, body) {
       write({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
       res.end('data: [DONE]\n\n');
     }
+    recordUsage({ ts: Date.now(), id, mode: 'cli', model, stream: true, ok: true, status: 200,
+      input_tokens: estimateTokens(prompt), output_tokens: null, credits: null, ttft_ms: null, duration_ms: Date.now() - t0 });
   } finally {
     release();
   }
@@ -350,6 +546,16 @@ const server = http.createServer(async (req, res) => {
       if (!authorized(req)) return sendJson(res, 401, errorPayload('unauthorized', 'auth_error'));
       const raw = await readRaw(req);
       return await handleResponses(req, res, raw);
+    }
+    if (req.method === 'GET' && url.pathname === '/v1/quota') {
+      if (!authorized(req)) return sendJson(res, 401, errorPayload('unauthorized', 'auth_error'));
+      const q = await getQuota();
+      if (!q) return sendJson(res, 503, errorPayload('quota unavailable (no valid GitHub token or upstream error)', 'auth_error'));
+      return sendJson(res, 200, q);
+    }
+    if (req.method === 'GET' && url.pathname === '/v1/usage') {
+      if (!authorized(req)) return sendJson(res, 401, errorPayload('unauthorized', 'auth_error'));
+      return sendJson(res, 200, usageSummary(url.searchParams.get('range')));
     }
     if (req.method === 'POST' && (url.pathname === '/v1/chat/completions' || url.pathname === '/chat/completions')) {
       if (!authorized(req)) return sendJson(res, 401, errorPayload('unauthorized', 'auth_error'));

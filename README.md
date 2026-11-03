@@ -99,8 +99,30 @@
 - GET /v1/models：模型列表。直连可用时返回 Copilot 真实目录（含 endpoints、上下文长度、最大输出），否则返回本地配置列表
 - POST /v1/responses：直连转发到 Copilot Responses API，支持 stream、tools、图片
 - POST /v1/chat/completions：CLI 回退模式，支持 stream: true/false
+- GET /v1/quota：额度快照（plan、重置日、premium_interactions 剩余/已用），缓存 5 分钟
+- GET /v1/usage?range=7d：用量聚合（summary、by_day、by_model、recent），range 支持 1h/7d/30d/today/all
 
 模型 id 以 /v1/models 为准。CLI 回退模式额外支持 default（不传 --model）和 auto（自动路由）。
+
+## 用量与额度
+
+桥接会在每次请求结束后写一条流水到 .usage/usage.jsonl（已 gitignore），字段包括：
+
+    ts, id, mode(direct|cli), model, stream, tools, body_bytes,
+    input_tokens, output_tokens, cached_tokens, credits, credits_raw,
+    ttft_ms, duration_ms, status, ok
+
+credit 数值取自 Copilot 响应的 copilot_usage.total_nano_aiu / 1e9（非流式在 JSON 顶层，流式在 response.completed 事件里）。
+
+- 额度来源：GET /v1/quota 代理 api.github.com/copilot_internal/user 的 quota_snapshots
+- 当前账号额度以 premium_interactions 为准（chat / completions 为 unlimited）
+- credit 单位换算是估算，若与 GitHub 后台存在偏差，可在 .usage 数据上按比例校正
+
+示例：
+
+    curl -s http://127.0.0.1:17866/v1/quota
+
+    curl -s 'http://127.0.0.1:17866/v1/usage?range=7d'
 
 ## 接到 DeepSeek Harness
 
