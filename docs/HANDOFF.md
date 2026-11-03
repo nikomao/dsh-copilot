@@ -5,7 +5,7 @@
 把 GitHub Copilot 包装成 OpenAI 兼容接口，接入 DeepSeek Harness，并规划一个 Copilot 用量中心。
 
 - 仓库：https://github.com/nikomao/dsh-copilot
-- 本地：/Users/Niko.Mao/Documents/deepseek-harness/default-workspace/codes/dsh-copilot
+- 本地：/Users/Niko.Mao/Codes/dsh-copilot
 - 版本：0.1.0，MIT
 
 ## 2. 当前状态
