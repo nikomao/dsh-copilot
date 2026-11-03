@@ -1,0 +1,26 @@
+{
+  "name": "dsh-copilot",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "GitHub Copilot provider and usage console for DeepSeek Harness",
+  "main": "server.mjs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nikomao/dsh-copilot.git"
+  },
+  "homepage": "https://github.com/nikomao/dsh-copilot#readme",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "github-copilot",
+    "openai-compatible",
+    "llm-bridge",
+    "dsh-plugin"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
